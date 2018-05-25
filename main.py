@@ -16,7 +16,7 @@ Flags = tf.app.flags
 # The system parameter
 Flags.DEFINE_string('output_dir', None, 'The output directory of the checkpoint')
 Flags.DEFINE_string('summary_dir', None, 'The dirctory to output the summary')
-Flags.DEFINE_string('mode', 'train', 'The mode of the model train, test.')
+Flags.DEFINE_string('mode', 'train', 'The mode of the model train, test, inference.')
 Flags.DEFINE_string('checkpoint', None, 'If provided, the weight will be restored from the provided checkpoint')
 Flags.DEFINE_boolean('pre_trained_model', False, 'If set True, the weight will be loaded but the global_step will still '
                                                  'be 0. If set False, you are going to continue the training. That is, '
@@ -27,6 +27,7 @@ Flags.DEFINE_string('vgg_ckpt', './vgg19/vgg_19.ckpt', 'path to checkpoint file 
 Flags.DEFINE_string('task', None, 'The task: SRGAN, SRResnet')
 # The data preparing operation
 Flags.DEFINE_integer('batch_size', 16, 'Batch size of the input batch')
+Flags.DEFINE_string('inf_LRimg', None, 'The filename of img for inferencing')
 Flags.DEFINE_string('input_dir_LR', None, 'The directory of the input resolution input data')
 Flags.DEFINE_string('input_dir_HR', None, 'The directory of the high resolution input data')
 Flags.DEFINE_boolean('flip', True, 'Whether random flip data augmentation is applied')
@@ -131,25 +132,42 @@ if FLAGS.mode == 'test':
     init_op = tf.global_variables_initializer()
 
     config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
+    config.gpu_options.allow_growth = True                        
     with tf.Session(config=config) as sess:
+        # Display graph in tensorboard
+        writer = tf.summary.FileWriter('logs', sess.graph)  # CWL Added   
+        
         # Load the pretrained model
         print('Loading weights from the pre-trained model')
         weight_initiallizer.restore(sess, FLAGS.checkpoint)
 
+        # Added for stat summarizer
+        ss = tf.contrib.stat_summarizer.NewStatSummarizer(
+            tf.get_default_graph().as_graph_def().SerializeToString())  # CWL Added   
+
         max_iter = len(test_data.inputs)
         print('Evaluation starts!!')
         for i in range(max_iter):
+            # Added for stat summarizer
+            run_metadata = tf.RunMetadata()  # CWL Added
+            run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)  # CWL Added
             input_im = np.array([test_data.inputs[i]]).astype(np.float32)
             target_im = np.array([test_data.targets[i]]).astype(np.float32)
             path_lr = test_data.paths_LR[i]
             path_hr = test_data.paths_HR[i]
             results = sess.run(save_fetch, feed_dict={inputs_raw: input_im, targets_raw: target_im,
-                                                      path_LR: path_lr, path_HR: path_hr})
+                                                      path_LR: path_lr, path_HR: path_hr},
+                                                      options=run_options, run_metadata=run_metadata)
+            ss.ProcessStepStatsStr(run_metadata.step_stats.SerializeToString())  # CWL Added
             filesets = save_images(results, FLAGS)
             for i, f in enumerate(filesets):
                 print('evaluate image', f['name'])
 
+        op_log = open('SRGAN_stat_summarizer_output.txt', 'w')  # CWL Added
+        op_log.write(ss.GetOutputString())  # CWL Added
+        op_log.close()  # CWL Added
+        writer.close()  # CWL Added
+        
 
 # the inference mode (just perform super resolution on the input image)
 elif FLAGS.mode == 'inference':
@@ -168,6 +186,7 @@ elif FLAGS.mode == 'inference':
     inference_data = inference_data_loader(FLAGS)
 
     inputs_raw = tf.placeholder(tf.float32, shape=[1, None, None, 3], name='inputs_raw')
+    outputs_raw = tf.placeholder(tf.float32, shape=[1, None, None, 3], name='outputs_raw')
     path_LR = tf.placeholder(tf.string, shape=[], name='path_LR')
 
     with tf.variable_scope('generator'):
@@ -191,7 +210,8 @@ elif FLAGS.mode == 'inference':
         save_fetch = {
             "path_LR": path_LR,
             "inputs": tf.map_fn(tf.image.encode_png, converted_inputs, dtype=tf.string, name='input_pngs'),
-            "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name='output_pngs')
+            "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name='output_pngs'),
+            "outputs_raw": converted_outputs
         }
 
     # Define the weight initiallizer (In inference time, we only need to restore the weight of the generator)
@@ -207,16 +227,19 @@ elif FLAGS.mode == 'inference':
         # Load the pretrained model
         print('Loading weights from the pre-trained model')
         weight_initiallizer.restore(sess, FLAGS.checkpoint)
-
-        max_iter = len(inference_data.inputs)
+        idx = inference_data.paths_LR.index(os.path.join(FLAGS.input_dir_LR,FLAGS.inf_LRimg))
+        # max_iter = len(inference_data.inputs)
         print('Evaluation starts!!')
-        for i in range(max_iter):
-            input_im = np.array([inference_data.inputs[i]]).astype(np.float32)
-            path_lr = inference_data.paths_LR[i]
-            results = sess.run(save_fetch, feed_dict={inputs_raw: input_im, path_LR: path_lr})
-            filesets = save_images(results, FLAGS)
-            for i, f in enumerate(filesets):
-                print('evaluate image', f['name'])
+        # for i in range(max_iter):
+        input_im = np.array([inference_data.inputs[idx]]).astype(np.float32)
+        path_lr = inference_data.paths_LR[idx]
+        start_time = time.time()
+        results = sess.run(save_fetch, feed_dict={inputs_raw: input_im, path_LR: path_lr})
+        print("took: %4.4fs" % (time.time() - start_time))
+        filesets = save_images(results, FLAGS)
+        print("LR size: %s /  generated HR size: %s" % (input_im.shape, results['outputs_raw'].shape))
+        for i, f in enumerate(filesets):
+            print('inference image', f['name'])
 
 
 # The training mode
